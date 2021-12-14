@@ -26,13 +26,15 @@ namespace WebsocketClient
         private static Stopwatch _workTimer = new Stopwatch();
         private static List<Stopwatch> _echoTimers;
 
-        public static string ServerUrl { get; set; }
+        public static Uri ServerUrl { get; set; }
         public static string Scenario { get; set; }
         public static int WarmupTimeSeconds { get; set; }
         public static int ExecutionTimeSeconds { get; set; }
         public static int Connections { get; set; }
         public static bool CollectLatency { get; set; }
         public static bool Insecure { get; set; }
+        public static bool Quiet { get; set; }
+        public static int MaxRequests { get; set; }
 
         static async Task Main(string[] args)
         {
@@ -43,26 +45,37 @@ namespace WebsocketClient
             var optionConnections = app.Option<int>("-c|--connections <N>", "Total number of Websocket connections to keep open", CommandOptionType.SingleValue);
             var optionWarmup = app.Option<int>("-w|--warmup <N>", "Duration of the warmup in seconds", CommandOptionType.SingleValue);
             var optionDuration = app.Option<int>("-d|--duration <N>", "Duration of the test in seconds", CommandOptionType.SingleValue);
+            var optionRequests = app.Option<int>("-r|--requests <N>", "Max number of requests", CommandOptionType.SingleValue);
             var optionScenario = app.Option("-s|--scenario <S>", "Scenario to run", CommandOptionType.SingleValue);
             var optionLatency = app.Option<bool>("-l|--latency <B>", "Whether to collect detailed latency", CommandOptionType.SingleOrNoValue);
             var optionInsecure = app.Option<bool>("-k|--insecure <B>", "Allow insecure server connections when using SSL", CommandOptionType.NoValue);
+            var optionQuiet = app.Option<bool>("-q|--quiet <B>", "Quiet log", CommandOptionType.NoValue);
 
             app.OnExecuteAsync(cancellationToken =>
             {
-                Log("Websocket Client starting");
-
                 BenchmarksEventSource.Log.Metadata("websocket/client-version", "first", "first", "Client Version", "Client Version", "object");
                 BenchmarksEventSource.Measure("websocket/client-version", typeof(ClientWebSocket).GetTypeInfo().Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion.ToString());
 
                 Scenario = optionScenario.Value();
 
-                ServerUrl = optionUrl.Value();
+                ServerUrl = new Uri(optionUrl.Value());
 
                 WarmupTimeSeconds = optionWarmup.HasValue()
                     ? int.Parse(optionWarmup.Value())
                     : 0;
 
-                ExecutionTimeSeconds = int.Parse(optionDuration.Value());
+                ExecutionTimeSeconds = optionDuration.HasValue()
+                    ? int.Parse(optionDuration.Value())
+                    : 0;
+
+                MaxRequests = optionRequests.HasValue()
+                    ? int.Parse(optionRequests.Value())
+                    : 0;
+
+                if ((ExecutionTimeSeconds > 0) == (MaxRequests > 0))
+                {
+                    throw new Exception($"Either -d or -r must be specified (not both).");
+                }
 
                 Connections = int.Parse(optionConnections.Value());
 
@@ -71,6 +84,10 @@ namespace WebsocketClient
                     : false;
 
                 Insecure = optionInsecure.HasValue();
+
+                Quiet = optionQuiet.HasValue();
+
+                Log("Websocket Client starting");
 
                 return RunAsync();
             });
@@ -87,26 +104,30 @@ namespace WebsocketClient
             if (WarmupTimeSeconds > 0)
             {
                 Log($"Warming up for {WarmupTimeSeconds}s...");
-                await StartScenario(WarmupTimeSeconds);
+                await StartScenario(WarmupTimeSeconds, MaxRequests);
                 CalculateStatistics();
             }
 
             ResetCounters();
-            Log($"Running for {ExecutionTimeSeconds}s...");
-            await StartScenario(ExecutionTimeSeconds);
+            if (MaxRequests > 0)
+                Log($"Running for {MaxRequests} requests...");
+            else
+                Log($"Running for {ExecutionTimeSeconds}s...");
+            await StartScenario(ExecutionTimeSeconds, MaxRequests);
             CalculateStatistics();
 
             await CloseConnections();
         }
 
-        private static async Task StartScenario(int executionTimeSeconds)
+        private static async Task StartScenario(int executionTimeSeconds, int maxRequets)
         {
             try
             {
                 var tasks = new List<Task>(_connections.Count);
 
                 var cts = new CancellationTokenSource();
-                cts.CancelAfter(TimeSpan.FromSeconds(executionTimeSeconds));
+                if (maxRequets <= 0)
+                    cts.CancelAfter(TimeSpan.FromSeconds(executionTimeSeconds));
                 _workTimer.Restart();
 
                 switch (Scenario)
@@ -123,12 +144,26 @@ namespace WebsocketClient
                             tasks.Add(Task.Run(async () =>
                             {
                                 var buffer = new byte[1024 * 4];
-                                while (!cts.IsCancellationRequested)
+                                if (maxRequets > 0)
                                 {
-                                    var stopped = await Echo(id, message, buffer);
-                                    if (stopped)
+                                    for (var j = 0; j < maxRequets; ++j)
                                     {
-                                        break;
+                                        var stopped = await Echo(id, message, buffer);
+                                        if (stopped)
+                                        {
+                                            break;
+                                        }
+                                    }
+                                }
+                                else
+                                {
+                                    while (!cts.IsCancellationRequested)
+                                    {
+                                        var stopped = await Echo(id, message, buffer);
+                                        if (stopped)
+                                        {
+                                            break;
+                                        }
                                     }
                                 }
                             }));
@@ -237,7 +272,15 @@ namespace WebsocketClient
                 client.Options.RemoteCertificateValidationCallback = delegate { return true; };
             }
 
-            await client.ConnectAsync(new Uri(ServerUrl), CancellationToken.None);
+            try
+            {
+
+                await client.ConnectAsync(ServerUrl, CancellationToken.None);
+            }
+            catch (Exception ex)
+            {
+                Log($"State: {client.State}, Exception: {ex}");
+            }
 
             lock (_connections)
             {
@@ -257,7 +300,10 @@ namespace WebsocketClient
             var tasks = new List<Task>(Connections);
             for (var i = 0; i < Connections; i++)
             {
-                tasks.Add(_connections[i].CloseAsync(WebSocketCloseStatus.NormalClosure, "Benchmark complete", CancellationToken.None));
+                if (_connections[i].State == WebSocketState.Open)
+                {
+                    tasks.Add(_connections[i].CloseAsync(WebSocketCloseStatus.NormalClosure, "Benchmark complete", CancellationToken.None));
+                }
             }
             await Task.WhenAll(tasks);
         }
@@ -293,13 +339,22 @@ namespace WebsocketClient
         private static void CalculateStatistics()
         {
             var totalRequests = 0;
+            var totalConnections = 0;
             var totalErrors = 0;
+            var totalFailedConnections = 0;
             var minRequests = int.MaxValue;
             var maxRequests = 0;
             var minErrors = int.MaxValue;
             var maxErrors = 0;
             for (var i = 0; i < Connections; i++)
             {
+                if (_connections[i].State != WebSocketState.Open)
+                {
+                    ++totalFailedConnections;
+                    continue;
+                }
+
+                ++totalConnections;
                 totalRequests += _requestsPerConnection[i];
                 totalErrors += _errorsPerConnection[i];
 
@@ -336,8 +391,10 @@ namespace WebsocketClient
             }
 
             var rps = (double)totalRequests / _workTimer.Elapsed.TotalSeconds;
-            Log($"Total RPS: {rps}");
-            Log($"Total Errors: {totalErrors}");
+            Log($"Total RPS: {rps}", verbose: false);
+            Log($"Total Errors: {totalErrors}", verbose: false);
+            Log($"Total Connections: {totalConnections}", verbose: false);
+            Log($"Total Failed Connections: {totalFailedConnections}", verbose: false);
 
             BenchmarksEventSource.Log.Metadata("websocket/rps/max", "max", "sum", "Max RPS", "RPS: max", "n0");
             BenchmarksEventSource.Log.Metadata("websocket/requests", "max", "sum", "Requests", "Total number of requests", "n0");
@@ -421,10 +478,12 @@ namespace WebsocketClient
             return (1.0 - fractionPart) * sortedData[(int)Math.Truncate(i) - 1] + fractionPart * sortedData[(int)Math.Ceiling(i) - 1];
         }
 
-        private static void Log(string message)
+        private static void Log(string message, bool verbose = true)
         {
-            var time = DateTime.Now.ToString("hh:mm:ss.fff");
-            Console.WriteLine($"[{time}] {message}");
+            if (!verbose || !Quiet)
+            {
+                Console.WriteLine($"[{DateTime.UtcNow:s}Z] {ServerUrl} {message}");
+            }
         }
     }
 }
