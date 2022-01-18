@@ -4,6 +4,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Linq;
 using System.Net.WebSockets;
 using System.Threading;
 using System.Threading.Tasks;
@@ -248,23 +249,42 @@ namespace WebsocketClient
 
         private static async Task CreateConnections()
         {
-            _connections = new List<ClientWebSocket>(Connections);
-            _requestsPerConnection = new List<int>(Connections);
-            _errorsPerConnection = new List<int>(Connections);
-            _latencyPerConnection = new List<List<double>>(Connections);
-            _latencyAverage = new List<(double sum, int count)>(Connections);
-            _echoTimers = new List<Stopwatch>(Connections);
+            _connections = new List<ClientWebSocket>();
+            _requestsPerConnection = new List<int>();
+            _errorsPerConnection = new List<int>();
+            _latencyPerConnection = new List<List<double>>();
+            _latencyAverage = new List<(double sum, int count)>();
+            _echoTimers = new List<Stopwatch>();
 
-            var tasks = new List<Task>(Connections);
-            for (var i = 0; i < Connections; i++)
+            var concurrent = false;
+            if (concurrent)
             {
-                tasks.Add(CreateConnection());
+                var tasks = new List<Task>();
+                for (var i = 0; i < Connections; i++)
+                {
+                    tasks.Add(CreateConnection());
+                }
+
+                await Task.WhenAll(tasks);
+            }
+            else
+            {
+                for (var i = 0; i < Connections; i++)
+                {
+                    var client = await CreateConnection();
+                    if (client.State != WebSocketState.Open)
+                    {
+                        break;
+                    }
+                }
             }
 
-            await Task.WhenAll(tasks);
+            var opened = _connections.Count(c => c.State == WebSocketState.Open);
+            Log($"Total Opened Connections: {opened}", verbose: false);
+            Log($"Total Failed Connections: {Connections - opened}", verbose: false);
         }
 
-        private static async Task CreateConnection()
+        private static async Task<ClientWebSocket> CreateConnection()
         {
             var client = new ClientWebSocket();
             if (Insecure)
@@ -274,7 +294,6 @@ namespace WebsocketClient
 
             try
             {
-
                 await client.ConnectAsync(ServerUrl, CancellationToken.None);
             }
             catch (Exception ex)
@@ -293,12 +312,14 @@ namespace WebsocketClient
                 _latencyPerConnection.Add(new List<double>());
                 _latencyAverage.Add((0, 0));
             }
+
+            return client;
         }
 
         private static async Task CloseConnections()
         {
-            var tasks = new List<Task>(Connections);
-            for (var i = 0; i < Connections; i++)
+            var tasks = new List<Task>();
+            for (var i = 0; i < _connections.Count; i++)
             {
                 if (_connections[i].State == WebSocketState.Open)
                 {
@@ -310,7 +331,7 @@ namespace WebsocketClient
 
         private static void ResetCounters()
         {
-            for (var i = 0; i < Connections; i++)
+            for (var i = 0; i < _connections.Count; i++)
             {
                 _requestsPerConnection[i] = 0;
                 _errorsPerConnection[i] = 0;
@@ -346,7 +367,7 @@ namespace WebsocketClient
             var maxRequests = 0;
             var minErrors = int.MaxValue;
             var maxErrors = 0;
-            for (var i = 0; i < Connections; i++)
+            for (var i = 0; i < _connections.Count; i++)
             {
                 if (_connections[i].State != WebSocketState.Open)
                 {
@@ -393,8 +414,6 @@ namespace WebsocketClient
             var rps = (double)totalRequests / _workTimer.Elapsed.TotalSeconds;
             Log($"Total RPS: {rps}", verbose: false);
             Log($"Total Errors: {totalErrors}", verbose: false);
-            Log($"Total Connections: {totalConnections}", verbose: false);
-            Log($"Total Failed Connections: {totalFailedConnections}", verbose: false);
 
             BenchmarksEventSource.Log.Metadata("websocket/rps/max", "max", "sum", "Max RPS", "RPS: max", "n0");
             BenchmarksEventSource.Log.Metadata("websocket/requests", "max", "sum", "Requests", "Total number of requests", "n0");
