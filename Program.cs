@@ -6,12 +6,12 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
 using System.Net.WebSockets;
+using System.Reflection;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
-using System.Reflection;
-using Microsoft.Crank.EventSources;
-
 using McMaster.Extensions.CommandLineUtils;
+using Microsoft.Crank.EventSources;
 
 namespace WebsocketClient
 {
@@ -133,7 +133,42 @@ namespace WebsocketClient
 
                 switch (Scenario)
                 {
-                    case "echo":
+                    case "text":
+                        for (var i = 0; i < _connections.Count; i++)
+                        {
+                            var id = i;
+
+                            var message = Encoding.UTF8.GetBytes(NextRandomString(EchoMessageSize));
+                            // kick off a task per connection so they don't wait for other connections when sending "Echo"
+                            tasks.Add(Task.Run(async () =>
+                            {
+                                var buffer = new byte[1024 * 4];
+                                if (maxRequets > 0)
+                                {
+                                    for (var j = 0; j < maxRequets; ++j)
+                                    {
+                                        var stopped = await Echo(id, message, buffer);
+                                        if (stopped)
+                                        {
+                                            break;
+                                        }
+                                    }
+                                }
+                                else
+                                {
+                                    while (!cts.IsCancellationRequested)
+                                    {
+                                        var stopped = await Echo(id, message, buffer);
+                                        if (stopped)
+                                        {
+                                            break;
+                                        }
+                                    }
+                                }
+                            }));
+                        }
+                        break;
+                    case "binary":
                         var random = new Random();
                         for (var i = 0; i < _connections.Count; i++)
                         {
@@ -184,6 +219,14 @@ namespace WebsocketClient
             }
         }
 
+        public static string NextRandomString(int length)
+        {
+            const string chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_=!?%/+-,";
+            var rnd = new Random();
+            return new string(Enumerable.Repeat(chars, length)
+                .Select(s => s[rnd.Next(s.Length)]).ToArray());
+        }
+
         private static async Task<bool> Echo(int id, byte[] message, byte[] buffer)
         {
             if (_connections[id].State != WebSocketState.Open)
@@ -196,7 +239,7 @@ namespace WebsocketClient
             _echoTimers[id].Restart();
             try
             {
-                await _connections[id].SendAsync(message.AsMemory(), WebSocketMessageType.Binary, true, CancellationToken.None);
+                await _connections[id].SendAsync(message.AsMemory(), Scenario == "text" ? WebSocketMessageType.Text : WebSocketMessageType.Binary, true, CancellationToken.None);
 
                 var received = 0;
                 var response = await _connections[id].ReceiveAsync(buffer.AsMemory(), CancellationToken.None);
@@ -221,17 +264,36 @@ namespace WebsocketClient
                     }
                 }
 
-                if (received != message.Length)
+                if (Scenario == "text")
                 {
-                    Log($"Errors received '{received}' != message.Length '{message.Length}'");
+                    var sentText = Encoding.UTF8.GetString(message, 0, message.Length);
+                    var receivedText = Encoding.UTF8.GetString(buffer, 0, received);
+                    if (receivedText.Length < sentText.Length)
+                    {
+                        Log($"Errors received receivedText.Length '{receivedText.Length}' <  sentText.Length '{sentText.Length}'");
+                    }
+                    else
+                    {
+                        if (!receivedText.Contains(sentText))
+                        {
+                            Log($"Errors received receivedText '{receivedText}' not contain sentText '{sentText}'");
+                        }
+                    }
                 }
                 else
                 {
-                    for (var i = 0; i < message.Length; ++i)
+                    if (received != message.Length)
                     {
-                        if (buffer[i] != message[i])
+                        Log($"Errors received '{received}' != message.Length '{message.Length}'");
+                    }
+                    else
+                    {
+                        for (var i = 0; i < message.Length; ++i)
                         {
-                            Log($"Errors buffer[{i}] '{buffer[i]}' != message[{i}] '{message[i]}'");
+                            if (buffer[i] != message[i])
+                            {
+                                Log($"Errors buffer[{i}] '{buffer[i]}' != message[{i}] '{message[i]}'");
+                            }
                         }
                     }
                 }
@@ -327,6 +389,15 @@ namespace WebsocketClient
                 }
             }
             await Task.WhenAll(tasks);
+
+            for (var i = 0; i < _connections.Count; i++)
+            {
+                if (_connections[i].CloseStatus != WebSocketCloseStatus.NormalClosure)
+                {
+                    _errorsPerConnection[i] += 1;
+                    Log($"Errors unexpected _connections[{i}].CloseStatus: '{_connections[i].CloseStatus}'");
+                }
+            }
         }
 
         private static void ResetCounters()
